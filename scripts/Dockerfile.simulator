@@ -1,0 +1,4 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY iec61850_simulator.py .
+CMD ["python", "-u", "iec61850_simulator.py", "--host", "${SIM_HOST:-backend}", "--port", "${SIM_PORT:-61850}", "--interval", "${SIM_INTERVAL:-1.0}"]
