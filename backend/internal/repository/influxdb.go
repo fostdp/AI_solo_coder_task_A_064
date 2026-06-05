@@ -8,6 +8,7 @@ import (
 
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
 	"github.com/influxdata/influxdb-client-go/v2/api"
+	"github.com/influxdata/influxdb-client-go/v2/api/write"
 )
 
 type InfluxDBRepo struct {
@@ -46,6 +47,32 @@ func (r *InfluxDBRepo) WriteTelemetry(telemetry model.DeviceTelemetry) error {
 		telemetry.Timestamp,
 	)
 	return r.writeAPI.WritePoint(context.Background(), p)
+}
+
+func (r *InfluxDBRepo) WriteTelemetryBatch(batch []model.DeviceTelemetry) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	points := make([]*write.Point, 0, len(batch))
+	for _, t := range batch {
+		p := influxdb2.NewPoint(
+			"device_telemetry",
+			map[string]string{
+				"device_id":   t.DeviceID,
+				"device_type": t.DeviceType,
+			},
+			map[string]interface{}{
+				"voltage":     t.Voltage,
+				"current":     t.Current,
+				"power":       t.Power,
+				"temperature": t.Temperature,
+				"load_rate":   t.LoadRate,
+			},
+			t.Timestamp,
+		)
+		points = append(points, p)
+	}
+	return r.writeAPI.WritePoint(context.Background(), points...)
 }
 
 func (r *InfluxDBRepo) QueryTelemetry(deviceID, rangeStr string) ([]model.DeviceTelemetry, error) {

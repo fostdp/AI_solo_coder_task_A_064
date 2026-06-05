@@ -2,17 +2,33 @@ package powerflow
 
 import (
 	"power-twin-backend/internal/model"
+	"crypto/sha256"
+	"encoding/json"
 	"math"
 	"time"
 )
 
 type PowerFlowCalculator struct {
-	Substations []model.Substation
-	Feeders     []model.Feeder
-	Telemetry   map[string]model.DeviceTelemetry
-	NodeIndex   map[string]int
-	YBus        [][]complex128
-	BaseVoltage float64
+	Substations       []model.Substation
+	Feeders           []model.Feeder
+	Telemetry         map[string]model.DeviceTelemetry
+	NodeIndex         map[string]int
+	YBus              [][]complex128
+	BaseVoltage       float64
+	topologyHash      [sha256.Size]byte
+	matrixValid       bool
+	lastConvergedV    []float64
+}
+
+func computeTopologyHash(substations []model.Substation, feeders []model.Feeder) [sha256.Size]byte {
+	h := sha256.New()
+	for _, s := range substations {
+		json.NewEncoder(h).Encode(s)
+	}
+	for _, f := range feeders {
+		json.NewEncoder(h).Encode(f)
+	}
+	return sha256.Sum256(h.Sum(nil))
 }
 
 func NewCalculator(substations []model.Substation, feeders []model.Feeder) *PowerFlowCalculator {
@@ -20,17 +36,30 @@ func NewCalculator(substations []model.Substation, feeders []model.Feeder) *Powe
 	for i, s := range substations {
 		nodeIndex[s.ID] = i
 	}
-	return &PowerFlowCalculator{
-		Substations: substations,
-		Feeders:     feeders,
-		Telemetry:   make(map[string]model.DeviceTelemetry),
-		NodeIndex:   nodeIndex,
-		BaseVoltage: 1500.0,
+	c := &PowerFlowCalculator{
+		Substations:  substations,
+		Feeders:      feeders,
+		Telemetry:    make(map[string]model.DeviceTelemetry),
+		NodeIndex:    nodeIndex,
+		BaseVoltage:  1500.0,
+		matrixValid:  false,
 	}
+	c.topologyHash = computeTopologyHash(substations, feeders)
+	return c
 }
 
 func (c *PowerFlowCalculator) SetTelemetry(telemetryMap map[string]model.DeviceTelemetry) {
 	c.Telemetry = telemetryMap
+}
+
+func (c *PowerFlowCalculator) UpdateFeeders(feeders []model.Feeder) {
+	newHash := computeTopologyHash(c.Substations, feeders)
+	if newHash != c.topologyHash {
+		c.Feeders = feeders
+		c.topologyHash = newHash
+		c.matrixValid = false
+		c.lastConvergedV = nil
+	}
 }
 
 func (c *PowerFlowCalculator) BuildAdmittanceMatrix() {
@@ -53,15 +82,27 @@ func (c *PowerFlowCalculator) BuildAdmittanceMatrix() {
 		c.YBus[i][i] += y
 		c.YBus[j][j] += y
 	}
+
+	c.matrixValid = true
+}
+
+func (c *PowerFlowCalculator) EnsureAdmittanceMatrix() {
+	if !c.matrixValid {
+		c.BuildAdmittanceMatrix()
+	}
 }
 
 func (c *PowerFlowCalculator) Solve(maxIter int, tolerance float64) (*model.PowerFlowResult, error) {
-	n := len(c.Substations)
-	c.BuildAdmittanceMatrix()
+	c.EnsureAdmittanceMatrix()
 
+	n := len(c.Substations)
 	voltages := make([]float64, n)
-	for i := range voltages {
-		voltages[i] = 1.0
+	if c.lastConvergedV != nil && len(c.lastConvergedV) == n {
+		copy(voltages, c.lastConvergedV)
+	} else {
+		for i := range voltages {
+			voltages[i] = 1.0
+		}
 	}
 
 	powerInjections := make([]float64, n)
@@ -75,6 +116,7 @@ func (c *PowerFlowCalculator) Solve(maxIter int, tolerance float64) (*model.Powe
 	slackBus := 0
 	converged := false
 	iterations := 0
+	var lastMaxMismatch float64 = 1e10
 
 	for iter := 0; iter < maxIter; iter++ {
 		iterations++
@@ -102,6 +144,16 @@ func (c *PowerFlowCalculator) Solve(maxIter int, tolerance float64) (*model.Powe
 			converged = true
 			break
 		}
+
+		if iter > 5 && maxMismatch > lastMaxMismatch*1.5 {
+			c.BuildAdmittanceMatrix()
+			for i := range voltages {
+				voltages[i] = 1.0
+			}
+			lastMaxMismatch = 1e10
+			continue
+		}
+		lastMaxMismatch = maxMismatch
 
 		jacobian := make([][]float64, n)
 		for i := range jacobian {
@@ -135,6 +187,11 @@ func (c *PowerFlowCalculator) Solve(maxIter int, tolerance float64) (*model.Powe
 				}
 			}
 		}
+	}
+
+	if converged {
+		c.lastConvergedV = make([]float64, n)
+		copy(c.lastConvergedV, voltages)
 	}
 
 	nodeVoltages := make(map[string]float64)
@@ -244,5 +301,3 @@ func solveLinearSystem(A [][]float64, b []float64, n int, slackBus int) []float6
 
 	return x
 }
-
-
