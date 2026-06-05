@@ -11,7 +11,7 @@ func NewN1Analyzer() *N1Analyzer {
 	return &N1Analyzer{}
 }
 
-func (a *N1Analyzer) Analyze(calculator *PowerFlowCalculator, feeders []model.Feeder, telemetryMap map[string]model.DeviceTelemetry) ([]model.N1Result, error) {
+func (a *N1Analyzer) Analyze(calculator *PowerFlowCalculator, feeders []model.Feeder, telemetryMap map[string]model.DeviceTelemetry, capacityRatio float64) ([]model.N1Result, error) {
 	var results []model.N1Result
 
 	for _, feeder := range feeders {
@@ -49,7 +49,7 @@ func (a *N1Analyzer) Analyze(calculator *PowerFlowCalculator, feeders []model.Fe
 		safe := len(overloads) == 0
 		var suggestion string
 		if !safe {
-			suggestion = a.GenerateTransferSuggestion(feeder, modifiedFeeders)
+			suggestion = a.GenerateTransferSuggestion(feeder, modifiedFeeders, capacityRatio)
 		}
 
 		results = append(results, model.N1Result{
@@ -63,12 +63,12 @@ func (a *N1Analyzer) Analyze(calculator *PowerFlowCalculator, feeders []model.Fe
 	return results, nil
 }
 
-func (a *N1Analyzer) GenerateTransferSuggestion(overloadedFeeder model.Feeder, adjacentFeeders []model.Feeder) string {
+func (a *N1Analyzer) GenerateTransferSuggestion(overloadedFeeder model.Feeder, adjacentFeeders []model.Feeder, capacityRatio float64) string {
 	var alternatives []model.Feeder
 	for _, f := range adjacentFeeders {
 		if f.SourceID == overloadedFeeder.SourceID || f.TargetID == overloadedFeeder.SourceID ||
 			f.SourceID == overloadedFeeder.TargetID || f.TargetID == overloadedFeeder.TargetID {
-			if f.RatedCurrent > overloadedFeeder.RatedCurrent*0.8 {
+			if f.RatedCurrent > overloadedFeeder.RatedCurrent*capacityRatio {
 				alternatives = append(alternatives, f)
 			}
 		}

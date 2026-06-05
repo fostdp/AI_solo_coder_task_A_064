@@ -2,12 +2,12 @@ package handler
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
-	"power-twin-backend/internal/alarm"
+	"power-twin-backend/internal/alarm_broker"
 	"power-twin-backend/internal/model"
-	"power-twin-backend/internal/powerflow"
+	"power-twin-backend/internal/powerflow_engine"
+	"power-twin-backend/internal/reliability_analyzer"
 	"power-twin-backend/internal/repository"
 	"power-twin-backend/internal/service"
 	"strings"
@@ -15,45 +15,23 @@ import (
 )
 
 type APIHandler struct {
-	topologySvc  *service.TopologyService
-	telemetrySvc *service.TelemetryService
-	powerFlowSvc *PowerFlowService
-	alarmSvc     *AlarmService
-	wsHub        *Hub
+	topologySvc         *service.TopologyService
+	pfEngine            *powerflow_engine.Engine
+	reliabilityAnalyzer *reliability_analyzer.Analyzer
+	alarmBroker         *alarm_broker.Broker
+	wsHub               *Hub
+	sqliteRepo          *repository.SQLiteRepo
 }
 
-type PowerFlowService struct {
-	sqliteRepo  *repository.SQLiteRepo
-	influxRepo  *repository.InfluxDBRepo
-	alarmEngine *alarm.AlarmEngine
-	wsHub       *Hub
-}
-
-type AlarmService struct {
-	sqliteRepo *repository.SQLiteRepo
-}
-
-func NewAPIHandler(topologySvc *service.TopologyService, telemetrySvc *service.TelemetryService, powerFlowSvc *PowerFlowService, alarmSvc *AlarmService, wsHub *Hub) *APIHandler {
+func NewAPIHandler(topologySvc *service.TopologyService, pfEngine *powerflow_engine.Engine, ra *reliability_analyzer.Analyzer, broker *alarm_broker.Broker, wsHub *Hub, sqliteRepo *repository.SQLiteRepo) *APIHandler {
 	return &APIHandler{
-		topologySvc:  topologySvc,
-		telemetrySvc: telemetrySvc,
-		powerFlowSvc: powerFlowSvc,
-		alarmSvc:     alarmSvc,
-		wsHub:        wsHub,
+		topologySvc:         topologySvc,
+		pfEngine:            pfEngine,
+		reliabilityAnalyzer: ra,
+		alarmBroker:         broker,
+		wsHub:               wsHub,
+		sqliteRepo:          sqliteRepo,
 	}
-}
-
-func NewPowerFlowService(sqliteRepo *repository.SQLiteRepo, influxRepo *repository.InfluxDBRepo, alarmEngine *alarm.AlarmEngine, wsHub *Hub) *PowerFlowService {
-	return &PowerFlowService{
-		sqliteRepo:  sqliteRepo,
-		influxRepo:  influxRepo,
-		alarmEngine: alarmEngine,
-		wsHub:       wsHub,
-	}
-}
-
-func NewAlarmService(sqliteRepo *repository.SQLiteRepo) *AlarmService {
-	return &AlarmService{sqliteRepo: sqliteRepo}
 }
 
 func (h *APIHandler) SetupRoutes(mux *http.ServeMux) {
@@ -132,30 +110,14 @@ func (h *APIHandler) handlePowerFlow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	subs, err := h.powerFlowSvc.sqliteRepo.GetSubstations()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	feeders, err := h.powerFlowSvc.sqliteRepo.GetFeeders()
+	result, err := h.pfEngine.RunCalculation()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	calc := powerflow.NewCalculator(subs, feeders)
-	telemetryMap := make(map[string]model.DeviceTelemetry)
-	calc.SetTelemetry(telemetryMap)
-
-	result, err := calc.Solve(50, 1e-6)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	result.Timestamp = time.Now()
-
-	if h.powerFlowSvc.wsHub != nil {
-		h.powerFlowSvc.wsHub.BroadcastMessage("powerflow_result", result)
+	if h.wsHub != nil {
+		h.wsHub.BroadcastMessage("powerflow_result", result)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -168,33 +130,14 @@ func (h *APIHandler) handleN1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	subs, err := h.powerFlowSvc.sqliteRepo.GetSubstations()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	feeders, err := h.powerFlowSvc.sqliteRepo.GetFeeders()
+	n1Results, err := h.reliabilityAnalyzer.RunN1Analysis()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	calc := powerflow.NewCalculator(subs, feeders)
-	analyzer := powerflow.NewN1Analyzer()
-	telemetryMap := make(map[string]model.DeviceTelemetry)
-
-	n1Results, err := analyzer.Analyze(calc, feeders, telemetryMap)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if h.powerFlowSvc.alarmEngine != nil {
-		h.powerFlowSvc.alarmEngine.CheckN1Results(n1Results)
-	}
-
-	if h.powerFlowSvc.wsHub != nil {
-		h.powerFlowSvc.wsHub.BroadcastMessage("n1_result", n1Results)
+	if h.wsHub != nil {
+		h.wsHub.BroadcastMessage("n1_result", n1Results)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -208,7 +151,7 @@ func (h *APIHandler) handleAlarms(w http.ResponseWriter, r *http.Request) {
 	}
 	ackStr := r.URL.Query().Get("acknowledged")
 	acknowledged := ackStr == "true" || ackStr == "1"
-	alarms, err := h.alarmSvc.sqliteRepo.GetAlarms(acknowledged)
+	alarms, err := h.sqliteRepo.GetAlarms(acknowledged)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -230,7 +173,7 @@ func (h *APIHandler) handleAlarmAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	alarmID := parts[0]
-	err := h.alarmSvc.sqliteRepo.AcknowledgeAlarm(alarmID)
+	err := h.sqliteRepo.AcknowledgeAlarm(alarmID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -257,50 +200,3 @@ func (h *APIHandler) handleKPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(metrics)
 }
-
-func (s *PowerFlowService) RunPeriodicCalculation() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		subs, err := s.sqliteRepo.GetSubstations()
-		if err != nil {
-			log.Printf("periodic power flow: get substations error: %v", err)
-			continue
-		}
-		feeders, err := s.sqliteRepo.GetFeeders()
-		if err != nil {
-			log.Printf("periodic power flow: get feeders error: %v", err)
-			continue
-		}
-
-		calc := powerflow.NewCalculator(subs, feeders)
-		telemetryMap := make(map[string]model.DeviceTelemetry)
-		calc.SetTelemetry(telemetryMap)
-
-		result, err := calc.Solve(50, 1e-6)
-		if err != nil {
-			log.Printf("periodic power flow error: %v", err)
-			continue
-		}
-		result.Timestamp = time.Now()
-
-		if s.wsHub != nil {
-			s.wsHub.BroadcastMessage("powerflow_result", result)
-		}
-
-		metrics := &model.KPIMetrics{
-			TotalPowerMW:         result.Losses * 1500 / 1e6,
-			LineLossMW:           result.Losses / 1e6,
-			VoltageQualifiedRate: 98.5,
-			Timestamp:            time.Now(),
-		}
-		if s.wsHub != nil {
-			s.wsHub.BroadcastMessage("kpi_update", metrics)
-		}
-
-		fmt.Printf("Periodic power flow: converged=%v, iterations=%d, losses=%.4f\n",
-			result.Converged, result.Iterations, result.Losses)
-	}
-}
-
-

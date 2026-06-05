@@ -12,6 +12,7 @@ import {
 
 interface TrendChartProps {
   deviceId: string
+  data?: Array<{ time: string; voltage: number; current: number; power: number; temperature: number }>
 }
 
 function generateDemoData() {
@@ -30,14 +31,17 @@ function generateDemoData() {
   return data
 }
 
-export default function TrendChart({ deviceId }: TrendChartProps) {
-  const [data, setData] = useState(generateDemoData)
+export default function TrendChart({ deviceId, data: externalData }: TrendChartProps) {
+  const [demoData, setDemoData] = useState(generateDemoData)
 
   useEffect(() => {
-    setData(generateDemoData())
+    setDemoData(generateDemoData())
   }, [deviceId])
 
-  const chartData = useMemo(() => data, [data])
+  const chartData = useMemo(() => {
+    if (externalData && externalData.length > 0) return externalData
+    return demoData
+  }, [externalData, demoData])
 
   return (
     <ResponsiveContainer width="100%" height={220}>

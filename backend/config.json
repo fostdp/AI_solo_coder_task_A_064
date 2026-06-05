@@ -1,0 +1,12 @@
+{
+  "max_iterations": 50,
+  "tolerance": 1e-6,
+  "overload_threshold": 100.0,
+  "overload_duration_sec": 10,
+  "scan_interval_sec": 30,
+  "powerflow_interval_sec": 30,
+  "base_voltage": 1500.0,
+  "voltage_min_pu": 0.9,
+  "voltage_max_pu": 1.1,
+  "feeder_capacity_ratio": 0.8
+}

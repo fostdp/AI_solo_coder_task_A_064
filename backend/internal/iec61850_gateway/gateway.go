@@ -1,4 +1,4 @@
-package simulator
+package iec61850_gateway
 
 import (
 	"bufio"
@@ -10,14 +10,16 @@ import (
 	"net"
 	"power-twin-backend/internal/model"
 	"power-twin-backend/internal/repository"
+	"sync"
 	"time"
 )
 
-type Simulator struct {
-	Port          int
-	Devices       []DeviceInfo
-	TelemetryChan chan model.DeviceTelemetry
-	sqliteRepo    *repository.SQLiteRepo
+type Gateway struct {
+	Port           int
+	Devices        []DeviceInfo
+	TelemetryOut   chan model.DeviceTelemetry
+	sqliteRepo     *repository.SQLiteRepo
+	latestTelemetry sync.Map
 }
 
 type DeviceInfo struct {
@@ -26,31 +28,31 @@ type DeviceInfo struct {
 	LineID     string
 }
 
-func NewSimulator(port int, sqliteRepo *repository.SQLiteRepo) *Simulator {
-	sim := &Simulator{
-		Port:          port,
-		TelemetryChan: make(chan model.DeviceTelemetry, 2000),
-		sqliteRepo:    sqliteRepo,
+func NewGateway(port int, sqliteRepo *repository.SQLiteRepo) *Gateway {
+	g := &Gateway{
+		Port:         port,
+		TelemetryOut: make(chan model.DeviceTelemetry, 2000),
+		sqliteRepo:   sqliteRepo,
 	}
-	sim.loadDevices()
-	return sim
+	g.loadDevices()
+	return g
 }
 
-func (s *Simulator) loadDevices() {
-	subs, err := s.sqliteRepo.GetSubstations()
+func (g *Gateway) loadDevices() {
+	subs, err := g.sqliteRepo.GetSubstations()
 	if err != nil {
 		log.Printf("load substations error: %v", err)
 		return
 	}
 	for _, sub := range subs {
-		s.Devices = append(s.Devices, DeviceInfo{
+		g.Devices = append(g.Devices, DeviceInfo{
 			DeviceID:   sub.ID,
 			DeviceType: "substation",
 			LineID:     sub.LineID,
 		})
 	}
 
-	rows, err := s.sqliteRepo.DB.Query("SELECT id, substation_id FROM rectifiers")
+	rows, err := g.sqliteRepo.DB.Query("SELECT id, substation_id FROM rectifiers")
 	if err != nil {
 		log.Printf("load rectifiers error: %v", err)
 		return
@@ -59,14 +61,14 @@ func (s *Simulator) loadDevices() {
 	for rows.Next() {
 		var id, subID string
 		rows.Scan(&id, &subID)
-		s.Devices = append(s.Devices, DeviceInfo{
+		g.Devices = append(g.Devices, DeviceInfo{
 			DeviceID:   id,
 			DeviceType: "rectifier",
 			LineID:     "",
 		})
 	}
 
-	rows2, err := s.sqliteRepo.DB.Query("SELECT id, substation_id FROM dc_switchgears")
+	rows2, err := g.sqliteRepo.DB.Query("SELECT id, substation_id FROM dc_switchgears")
 	if err != nil {
 		log.Printf("load switchgears error: %v", err)
 		return
@@ -75,59 +77,60 @@ func (s *Simulator) loadDevices() {
 	for rows2.Next() {
 		var id, subID string
 		rows2.Scan(&id, &subID)
-		s.Devices = append(s.Devices, DeviceInfo{
+		g.Devices = append(g.Devices, DeviceInfo{
 			DeviceID:   id,
 			DeviceType: "dc_switchgear",
 			LineID:     "",
 		})
 	}
 
-	log.Printf("Simulator loaded %d devices", len(s.Devices))
+	log.Printf("Gateway loaded %d devices", len(g.Devices))
 }
 
-func (s *Simulator) Start() {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", s.Port))
+func (g *Gateway) Start() {
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", g.Port))
 	if err != nil {
-		log.Printf("simulator listen error: %v", err)
+		log.Printf("gateway listen error: %v", err)
 		return
 	}
-	log.Printf("IEC 61850 simulator listening on :%d", s.Port)
+	log.Printf("IEC 61850 gateway listening on :%d", g.Port)
 
-	go s.generateLoop()
+	go g.generateLoop()
 
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Printf("simulator accept error: %v", err)
+			log.Printf("gateway accept error: %v", err)
 			continue
 		}
-		go s.handleConnection(conn)
+		go g.handleConnection(conn)
 	}
 }
 
-func (s *Simulator) generateLoop() {
+func (g *Gateway) generateLoop() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		for _, dev := range s.Devices {
-			t := s.GenerateTelemetry(dev.DeviceID, dev.DeviceType)
+		for _, dev := range g.Devices {
+			t := g.GenerateTelemetry(dev.DeviceID, dev.DeviceType)
+			g.latestTelemetry.Store(dev.DeviceID, t)
 			select {
-			case s.TelemetryChan <- t:
+			case g.TelemetryOut <- t:
 			default:
 			}
 		}
 	}
 }
 
-func (s *Simulator) handleConnection(conn net.Conn) {
+func (g *Gateway) handleConnection(conn net.Conn) {
 	defer conn.Close()
 	writer := bufio.NewWriter(conn)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		for _, dev := range s.Devices {
-			t := s.GenerateTelemetry(dev.DeviceID, dev.DeviceType)
+		for _, dev := range g.Devices {
+			t := g.GenerateTelemetry(dev.DeviceID, dev.DeviceType)
 			data, err := json.Marshal(t)
 			if err != nil {
 				continue
@@ -139,7 +142,7 @@ func (s *Simulator) handleConnection(conn net.Conn) {
 	}
 }
 
-func (s *Simulator) GenerateTelemetry(deviceID, deviceType string) model.DeviceTelemetry {
+func (g *Gateway) GenerateTelemetry(deviceID, deviceType string) model.DeviceTelemetry {
 	var voltage, maxCurrent, temperature, loadRate float64
 
 	faultChance := rand.Float64()
@@ -181,4 +184,17 @@ func (s *Simulator) GenerateTelemetry(deviceID, deviceType string) model.DeviceT
 		LoadRate:    math.Round(loadRate*100) / 100,
 		Timestamp:   time.Now(),
 	}
+}
+
+func (g *Gateway) GetLatestTelemetry() map[string]model.DeviceTelemetry {
+	result := make(map[string]model.DeviceTelemetry)
+	g.latestTelemetry.Range(func(key, value interface{}) bool {
+		if k, ok := key.(string); ok {
+			if v, ok := value.(model.DeviceTelemetry); ok {
+				result[k] = v
+			}
+		}
+		return true
+	})
+	return result
 }

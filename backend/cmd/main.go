@@ -3,16 +3,25 @@ package main
 import (
 	"log"
 	"net/http"
-	"power-twin-backend/internal/alarm"
+	"power-twin-backend/internal/alarm_broker"
+	"power-twin-backend/internal/config"
 	"power-twin-backend/internal/handler"
+	"power-twin-backend/internal/iec61850_gateway"
+	"power-twin-backend/internal/model"
 	"power-twin-backend/internal/mqtt"
+	"power-twin-backend/internal/powerflow_engine"
+	"power-twin-backend/internal/reliability_analyzer"
 	"power-twin-backend/internal/repository"
 	"power-twin-backend/internal/service"
-	"power-twin-backend/internal/simulator"
 )
 
 func main() {
 	log.Println("Starting Urban Rail Transit Power Supply Digital Twin Platform...")
+
+	cfg, err := config.LoadN1Config("./config.json")
+	if err != nil {
+		log.Printf("Config load error, using defaults: %v", err)
+	}
 
 	influxRepo := repository.NewInfluxDBRepo(
 		"http://localhost:8086",
@@ -33,32 +42,69 @@ func main() {
 	go wsHub.Run()
 	log.Println("WebSocket hub started")
 
-	alarmEngine := alarm.NewAlarmEngine(sqliteRepo, mqttPublisher, wsHub)
-	log.Println("Alarm engine initialized")
+	telemetryCh := make(chan model.DeviceTelemetry, 2000)
+	telemetryToPF := make(chan model.DeviceTelemetry, 2000)
+	telemetryToBroker := make(chan model.DeviceTelemetry, 2000)
 
-	topologySvc := service.NewTopologyService(sqliteRepo, influxRepo)
-	telemetrySvc := service.NewTelemetryService(influxRepo, sqliteRepo, alarmEngine)
-	powerFlowSvc := handler.NewPowerFlowService(sqliteRepo, influxRepo, alarmEngine, wsHub)
-	alarmSvc := handler.NewAlarmService(sqliteRepo)
+	flowResultFromEngine := make(chan powerflow_engine.PowerFlowResultMsg, 64)
+	flowResultToRA := make(chan powerflow_engine.PowerFlowResultMsg, 64)
 
-	apiHandler := handler.NewAPIHandler(topologySvc, telemetrySvc, powerFlowSvc, alarmSvc, wsHub)
-
-	sim := simulator.NewSimulator(61850, sqliteRepo)
-	go sim.Start()
-	log.Println("IEC 61850 simulator started on port 61850")
+	n1ResultFromRA := make(chan reliability_analyzer.N1AnalysisMsg, 64)
+	n1ResultToBroker := make(chan reliability_analyzer.N1AnalysisMsg, 64)
 
 	go func() {
-		for telemetry := range sim.TelemetryChan {
-			err := telemetrySvc.ProcessTelemetry(telemetry)
-			if err != nil {
-				log.Printf("Process telemetry error: %v", err)
+		for t := range telemetryCh {
+			select {
+			case telemetryToPF <- t:
+			default:
 			}
-			wsHub.BroadcastMessage("telemetry_update", telemetry)
+			select {
+			case telemetryToBroker <- t:
+			default:
+			}
 		}
 	}()
 
-	go powerFlowSvc.RunPeriodicCalculation()
-	log.Println("Periodic power flow calculation started (every 30s)")
+	go func() {
+		for msg := range flowResultFromEngine {
+			select {
+			case flowResultToRA <- msg:
+			default:
+			}
+			wsHub.BroadcastMessage("powerflow_result", msg.Result)
+		}
+	}()
+
+	go func() {
+		for msg := range n1ResultFromRA {
+			select {
+			case n1ResultToBroker <- msg:
+			default:
+			}
+			wsHub.BroadcastMessage("n1_result", msg.N1Results)
+		}
+	}()
+
+	gateway := iec61850_gateway.NewGateway(61850, sqliteRepo)
+	gateway.TelemetryOut = telemetryCh
+
+	pfEngine := powerflow_engine.NewEngine(telemetryToPF, sqliteRepo, influxRepo, cfg)
+	pfEngine.ResultOut = flowResultFromEngine
+
+	ra := reliability_analyzer.NewAnalyzer(flowResultToRA, sqliteRepo, cfg)
+	ra.AnalysisOut = n1ResultFromRA
+
+	broker := alarm_broker.NewBroker(telemetryToBroker, n1ResultToBroker, sqliteRepo, mqttPublisher, wsHub, cfg)
+
+	go gateway.Start()
+	go pfEngine.Start()
+	go ra.Start()
+	go broker.Start()
+
+	log.Println("IEC 61850 gateway started on port 61850")
+
+	topologySvc := service.NewTopologyService(sqliteRepo, influxRepo)
+	apiHandler := handler.NewAPIHandler(topologySvc, pfEngine, ra, broker, wsHub, sqliteRepo)
 
 	mux := http.NewServeMux()
 	apiHandler.SetupRoutes(mux)
