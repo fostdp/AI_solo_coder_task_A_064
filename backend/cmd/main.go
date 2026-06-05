@@ -3,17 +3,30 @@ package main
 import (
 	"log"
 	"net/http"
+	"net/http/pprof"
+	"os"
 	"power-twin-backend/internal/alarm_broker"
 	"power-twin-backend/internal/config"
 	"power-twin-backend/internal/handler"
 	"power-twin-backend/internal/iec61850_gateway"
+	"power-twin-backend/internal/metrics"
 	"power-twin-backend/internal/model"
 	"power-twin-backend/internal/mqtt"
 	"power-twin-backend/internal/powerflow_engine"
 	"power-twin-backend/internal/reliability_analyzer"
 	"power-twin-backend/internal/repository"
 	"power-twin-backend/internal/service"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 func main() {
 	log.Println("Starting Urban Rail Transit Power Supply Digital Twin Platform...")
@@ -23,11 +36,18 @@ func main() {
 		log.Printf("Config load error, using defaults: %v", err)
 	}
 
+	influxURL := getEnv("INFLUXDB_URL", "http://localhost:8086")
+	influxToken := getEnv("INFLUXDB_TOKEN", "my-token")
+	influxOrg := getEnv("INFLUXDB_ORG", "power-twin")
+	influxBucket := getEnv("INFLUXDB_BUCKET", "telemetry")
+	mqttBroker := getEnv("MQTT_BROKER", "tcp://localhost:1883")
+	serverPort := getEnv("SERVER_PORT", "8080")
+
 	influxRepo := repository.NewInfluxDBRepo(
-		"http://localhost:8086",
-		"my-token",
-		"power-twin",
-		"telemetry",
+		influxURL,
+		influxToken,
+		influxOrg,
+		influxBucket,
 	)
 
 	sqliteRepo, err := repository.NewSQLiteRepo("./power_twin.db")
@@ -36,7 +56,7 @@ func main() {
 	}
 	log.Println("SQLite database initialized")
 
-	mqttPublisher := mqtt.NewMQTTPublisher("tcp://localhost:1883", "power-twin-backend")
+	mqttPublisher := mqtt.NewMQTTPublisher(mqttBroker, "power-twin-backend")
 
 	wsHub := handler.NewHub()
 	go wsHub.Run()
@@ -85,6 +105,20 @@ func main() {
 		}
 	}()
 
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			metrics.ChannelBacklog.WithLabelValues("telemetryCh").Set(float64(len(telemetryCh)))
+			metrics.ChannelBacklog.WithLabelValues("telemetryToPF").Set(float64(len(telemetryToPF)))
+			metrics.ChannelBacklog.WithLabelValues("telemetryToBroker").Set(float64(len(telemetryToBroker)))
+			metrics.ChannelBacklog.WithLabelValues("flowResultFromEngine").Set(float64(len(flowResultFromEngine)))
+			metrics.ChannelBacklog.WithLabelValues("flowResultToRA").Set(float64(len(flowResultToRA)))
+			metrics.ChannelBacklog.WithLabelValues("n1ResultFromRA").Set(float64(len(n1ResultFromRA)))
+			metrics.ChannelBacklog.WithLabelValues("n1ResultToBroker").Set(float64(len(n1ResultToBroker)))
+		}
+	}()
+
 	gateway := iec61850_gateway.NewGateway(61850, sqliteRepo)
 	gateway.TelemetryOut = telemetryCh
 
@@ -109,8 +143,14 @@ func main() {
 	mux := http.NewServeMux()
 	apiHandler.SetupRoutes(mux)
 
-	log.Println("Server starting on :8080")
-	if err := http.ListenAndServe(":8080", mux); err != nil {
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+	addr := ":" + serverPort
+	log.Printf("Server starting on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }

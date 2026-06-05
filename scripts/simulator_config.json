@@ -1,0 +1,14 @@
+{
+  "substations": 60,
+  "devices_per_sub": 10,
+  "lines": 3,
+  "interval": 1.0,
+  "normal_load_min": 30,
+  "normal_load_max": 70,
+  "abnormal_load_min": 105,
+  "abnormal_load_max": 120,
+  "abnormal_probability": 0.05,
+  "voltage_nominal": 1500,
+  "voltage_stddev": 25,
+  "voltage_dip_probability": 0.02
+}

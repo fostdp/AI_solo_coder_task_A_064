@@ -9,36 +9,51 @@ services:
     environment:
       DOCKER_INFLUXDB_INIT_MODE: setup
       DOCKER_INFLUXDB_INIT_USERNAME: admin
-      DOCKER_INFLUXDB_INIT_PASSWORD: admin123456
+      DOCKER_INFLUXDB_INIT_PASSWORD: power-twin-admin-2024
       DOCKER_INFLUXDB_INIT_ORG: power-twin
-      DOCKER_INFLUXDB_INIT_BUCKET: power_telemetry
+      DOCKER_INFLUXDB_INIT_BUCKET: telemetry
       DOCKER_INFLUXDB_INIT_RETENTION: 30d
       DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: power-twin-admin-token-2024
     volumes:
       - influxdb-data:/var/lib/influxdb2
+      - ./influxdb:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD", "influx", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
+    networks:
+      - power-twin-net
 
   mosquitto:
-    image: eclipse-mosquitto:2
+    image: eclipse-mosquitto:2.0
     container_name: power-twin-mosquitto
     ports:
       - "1883:1883"
     volumes:
-      - mosquitto-data:/mosquitto/data
-      - mosquitto-log:/mosquitto/log
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/var/lib/mosquitto
     healthcheck:
       test: ["CMD", "mosquitto_pub", "-h", "localhost", "-t", "healthcheck", "-m", "ok"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
+    networks:
+      - power-twin-net
 
   backend:
     build:
@@ -52,16 +67,28 @@ services:
       INFLUXDB_URL: http://influxdb:8086
       INFLUXDB_TOKEN: power-twin-admin-token-2024
       INFLUXDB_ORG: power-twin
-      INFLUXDB_BUCKET: power_telemetry
+      INFLUXDB_BUCKET: telemetry
       MQTT_BROKER: tcp://mosquitto:1883
-      TCP_LISTEN_ADDR: 0.0.0.0:61850
-      HTTP_LISTEN_ADDR: 0.0.0.0:8080
+      SERVER_PORT: "8080"
     depends_on:
       influxdb:
         condition: service_healthy
       mosquitto:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
+    networks:
+      - power-twin-net
 
   frontend:
     build:
@@ -69,13 +96,18 @@ services:
       dockerfile: Dockerfile
     container_name: power-twin-frontend
     ports:
-      - "3000:3000"
-    environment:
-      VITE_API_URL: http://localhost:8080
-      VITE_WS_URL: ws://localhost:8080/ws
+      - "80:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
+    networks:
+      - power-twin-net
 
   simulator:
     build:
@@ -84,17 +116,29 @@ services:
     container_name: power-twin-simulator
     environment:
       SIM_HOST: backend
-      SIM_PORT: 61850
-      SIM_INTERVAL: 1.0
+      SIM_PORT: "61850"
+      SIM_INTERVAL: "1.0"
+      SIM_SUBSTATIONS: "60"
+      SIM_DEVICES_PER_SUB: "10"
       SIM_FAULT_MODE: "false"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
+    networks:
+      - power-twin-net
 
 volumes:
   influxdb-data:
     driver: local
   mosquitto-data:
     driver: local
-  mosquitto-log:
-    driver: local
+
+networks:
+  power-twin-net:
+    driver: bridge

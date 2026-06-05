@@ -1,4 +1,13 @@
 FROM python:3.11-slim
+
 WORKDIR /app
 COPY iec61850_simulator.py .
-CMD ["python", "-u", "iec61850_simulator.py", "--host", "${SIM_HOST:-backend}", "--port", "${SIM_PORT:-61850}", "--interval", "${SIM_INTERVAL:-1.0}"]
+
+ENV SIM_HOST=backend
+ENV SIM_PORT=61850
+ENV SIM_INTERVAL=1.0
+ENV SIM_SUBSTATIONS=60
+ENV SIM_DEVICES_PER_SUB=10
+ENV SIM_FAULT_MODE=false
+
+ENTRYPOINT ["/bin/sh", "-c", "python -u iec61850_simulator.py --host $SIM_HOST --port $SIM_PORT --interval $SIM_INTERVAL --substations $SIM_SUBSTATIONS --devices-per-sub $SIM_DEVICES_PER_SUB ${SIM_FAULT_MODE:+--fault-mode}"]

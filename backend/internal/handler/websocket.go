@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"power-twin-backend/internal/metrics"
 	"power-twin-backend/internal/model"
 	"sync"
 	"time"
@@ -43,11 +44,13 @@ func (h *Hub) Run() {
 			h.mu.Lock()
 			h.clients[client] = true
 			h.mu.Unlock()
+			metrics.WebSocketClients.Inc()
 		case client := <-h.unregister:
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
+				metrics.WebSocketClients.Dec()
 			}
 			h.mu.Unlock()
 		case message := <-h.broadcast:

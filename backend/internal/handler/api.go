@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"power-twin-backend/internal/alarm_broker"
+	"power-twin-backend/internal/metrics"
 	"power-twin-backend/internal/model"
 	"power-twin-backend/internal/powerflow_engine"
 	"power-twin-backend/internal/reliability_analyzer"
@@ -110,11 +111,19 @@ func (h *APIHandler) handlePowerFlow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	start := time.Now()
 	result, err := h.pfEngine.RunCalculation()
+	metrics.PowerFlowCalcDuration.Observe(time.Since(start).Seconds())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	converged := "false"
+	if result.Converged {
+		converged = "true"
+	}
+	metrics.PowerFlowConverged.WithLabelValues(converged).Inc()
 
 	if h.wsHub != nil {
 		h.wsHub.BroadcastMessage("powerflow_result", result)
@@ -130,7 +139,9 @@ func (h *APIHandler) handleN1(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	start := time.Now()
 	n1Results, err := h.reliabilityAnalyzer.RunN1Analysis()
+	metrics.N1AnalysisDuration.Observe(time.Since(start).Seconds())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -187,10 +198,10 @@ func (h *APIHandler) handleKPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	metrics, err := h.topologySvc.GetKPIMetrics()
+	kpiData, err := h.topologySvc.GetKPIMetrics()
 	if err != nil {
 		log.Printf("KPI metrics error: %v", err)
-		metrics = &model.KPIMetrics{
+		kpiData = &model.KPIMetrics{
 			TotalPowerMW:         0,
 			LineLossMW:           0,
 			VoltageQualifiedRate: 0,
@@ -198,5 +209,5 @@ func (h *APIHandler) handleKPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(metrics)
+	json.NewEncoder(w).Encode(kpiData)
 }
